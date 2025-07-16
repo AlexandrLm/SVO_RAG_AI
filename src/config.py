@@ -22,7 +22,7 @@ CHROMA_COLLECTION_NAME = "svo_rag_docs"
 
 # --- Настройки RAG ---
 # Количество извлекаемых чанков
-K_RETRIEVED_CHUNKS = 5
+K_RETRIEVED_CHUNKS = 10
 # Размер чанка при нарезке документов
 CHUNK_SIZE = 1000
 # Перекрытие чанков
@@ -30,4 +30,4 @@ CHUNK_OVERLAP = 150
 
 # --- Настройки истории диалогов ---
 # Количество последних сообщений для хранения в контексте
-HISTORY_MESSAGES_TO_KEEP = 14 
+HISTORY_MESSAGES_TO_KEEP = 2 
