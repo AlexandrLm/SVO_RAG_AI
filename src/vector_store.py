@@ -1,13 +1,17 @@
 import chromadb
+import logging
+from src.config import CHROMA_DB_PATH, CHROMA_COLLECTION_NAME
 
-def get_chroma_collection(path="./chroma_db", collection_name="svo_rag_docs"):
+logger = logging.getLogger(__name__)
+
+def get_chroma_collection():
     """
     Инициализирует персистентный клиент ChromaDB и возвращает коллекцию.
     Данные будут храниться на диске в папке 'chroma_db'.
     """
-    client = chromadb.PersistentClient(path=path)
-    collection = client.get_or_create_collection(name=collection_name)
-    print(f"ChromaDB коллекция '{collection_name}' готова. Текущее количество документов: {collection.count()}.")
+    client = chromadb.PersistentClient(path=CHROMA_DB_PATH)
+    collection = client.get_or_create_collection(name=CHROMA_COLLECTION_NAME)
+    logger.info(f"ChromaDB коллекция '{CHROMA_COLLECTION_NAME}' готова. Текущее количество документов: {collection.count()}.")
     return collection
 
 def populate_collection(collection, chunks, model):
@@ -15,10 +19,10 @@ def populate_collection(collection, chunks, model):
     Заполняет коллекцию ChromaDB чанками документов.
     """
     if not chunks:
-        print("Нет чанков для добавления в коллекцию.")
+        logger.warning("Нет чанков для добавления в коллекцию.")
         return
 
-    print(f"Начинается заполнение коллекции... Всего чанков: {len(chunks)}")
+    logger.info(f"Начинается заполнение коллекции... Всего чанков: {len(chunks)}")
     
     # Создаем эмбеддинги для чанков
     embeddings = model.encode(chunks, show_progress_bar=True, convert_to_numpy=True)
@@ -30,25 +34,26 @@ def populate_collection(collection, chunks, model):
     batch_size = 100
     for i in range(0, len(chunks), batch_size):
         end_i = min(i + batch_size, len(chunks))
-        print(f"Добавление батча в ChromaDB: {i+1}-{end_i}")
+        logger.info(f"Добавление батча в ChromaDB: {i+1}-{end_i}")
         collection.add(
             embeddings=embeddings[i:end_i].tolist(), # ChromaDB ожидает list
             documents=chunks[i:end_i],
             ids=ids[i:end_i]
         )
     
-    print("Заполнение коллекции успешно завершено.")
-    print(f"Новое количество документов в коллекции: {collection.count()}.")
+    logger.info("Заполнение коллекции успешно завершено.")
+    logger.info(f"Новое количество документов в коллекции: {collection.count()}.")
 
 
-def search_in_store(query, model, collection, k=5):
+def search_in_store(query, model, collection, k=3) -> list[str]:
     """
-    Ищет в коллекции ChromaDB k наиболее релевантных чанков.
+    Ищет в коллекции ChromaDB k наиболее релевантных чанков и возвращает их как список строк.
     """
     if collection is None:
-        return "Коллекция ChromaDB не инициализирована."
+        logger.error("Коллекция ChromaDB не инициализирована.")
+        return ["Коллекция ChromaDB не инициализирована."]
 
-    print(f"\nПоиск информации по запросу: '{query}'")
+    logger.info(f"Поиск информации по запросу: '{query}'")
     # Создаем эмбеддинг для запроса
     query_embedding = model.encode([query]).tolist()
     
@@ -59,6 +64,6 @@ def search_in_store(query, model, collection, k=5):
     )
     
     # Извлекаем найденные документы для формирования контекста
-    context = "\n---\n".join(results['documents'][0])
-    print(f"Найденный контекст для генерации ответа:\n{context[:400]}...")
-    return context 
+    documents = results.get('documents', [[]])[0]
+    logger.info(f"Найдено {len(documents)} релевантн(ых) чанков.")
+    return documents 

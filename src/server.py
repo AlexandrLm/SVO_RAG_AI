@@ -1,14 +1,23 @@
 import sys
 import os
 import asyncio
+import logging
+import re
 
 from fastapi import FastAPI, HTTPException, Depends
 from pydantic import BaseModel
 from qwen_agent.agents import Assistant
-from src.agent_config import get_llm_config, get_system_instruction, HelpdeskRetriever
+from qwen_agent.llm import get_chat_model
+from src.agent_config import get_llm_config, get_system_instruction, KnowledgeBaseRetriever
 from src.data_processor import initialize_embedding_model, load_and_chunk_pdfs
 from src.vector_store import get_chroma_collection, populate_collection
 from src.history_manager import init_db, get_history, add_message, prune_history
+from src.config import DOCS_DIR, HISTORY_MESSAGES_TO_KEEP
+from src.logger_config import setup_logging
+
+# --- Настройка логирования ---
+setup_logging()
+logger = logging.getLogger(__name__)
 
 # --- Модели данных для API (Pydantic) ---
 
@@ -18,6 +27,15 @@ class AskRequest(BaseModel):
 
 class AskResponse(BaseModel):
     answer: str
+
+def _strip_think_content(text: str) -> str:
+    """
+    Принудительно удаляет блоки <think>...</think> из ответа LLM.
+    """
+    if not text:
+        return ""
+    return re.sub(r'<think>.*?</think>', '', text, flags=re.DOTALL).strip()
+
 
 # --- Инициализация FastAPI и состояние приложения ---
 
@@ -37,53 +55,56 @@ async def startup_event():
     """
     Асинхронная инициализация всех необходимых компонентов при старте сервера.
     """
-    print("Инициализация сервера...")
+    logger.info("Инициализация сервера...")
     
     # Инициализация и очистка истории
     init_db()
-    prune_history(messages_to_keep=14)
+    prune_history()
 
     loop = asyncio.get_event_loop()
     
     # 1. Инициализация моделей
     app_state["embedding_model"] = await loop.run_in_executor(None, initialize_embedding_model)
-    print("Модель для эмбеддингов загружена.")
+    logger.info("Модель для эмбеддингов загружена.")
     
     # 2. Инициализация ChromaDB
     app_state["chroma_collection"] = await loop.run_in_executor(None, get_chroma_collection)
-    print("База векторов ChromaDB инициализирована.")
+    logger.info("База векторов ChromaDB инициализирована.")
     
     # 3. Загрузка документов в базу, если это необходимо
     collection = app_state["chroma_collection"]
     if await loop.run_in_executor(None, collection.count) == 0:
-        print("База знаний пуста. Начинается обработка и заполнение...")
-        docs_folder = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'docs')
-        if not os.path.exists(docs_folder) or not os.listdir(docs_folder):
-            raise RuntimeError(f"Папка '{docs_folder}' пуста или не существует. Невозможно заполнить базу знаний.")
+        logger.info("База знаний пуста. Начинается обработка и заполнение...")
+        if not os.path.exists(DOCS_DIR) or not os.listdir(DOCS_DIR):
+            error_msg = f"Папка '{DOCS_DIR}' пуста или не существует. Невозможно заполнить базу знаний."
+            logger.error(error_msg)
+            raise RuntimeError(error_msg)
         
-        document_chunks = await loop.run_in_executor(None, load_and_chunk_pdfs, docs_folder)
+        document_chunks = await loop.run_in_executor(None, load_and_chunk_pdfs, DOCS_DIR)
         await loop.run_in_executor(None, populate_collection, collection, document_chunks, app_state["embedding_model"])
     else:
-        print("База знаний уже заполнена, пропуск обработки документов.")
+        logger.info("База знаний уже заполнена, пропуск обработки документов.")
 
     # 4. Настройка и создание экземпляра агента (бота)
     llm_cfg = get_llm_config()
     system_instruction = get_system_instruction()
     
     # Инициализация и настройка кастомного инструмента
-    helpdesk_tool = HelpdeskRetriever()
-    helpdesk_tool.embedding_model = app_state["embedding_model"]
-    helpdesk_tool.chroma_collection = app_state["chroma_collection"]
-    
-    tools = [helpdesk_tool]
+    knowledge_retriever = KnowledgeBaseRetriever(
+        embedding_model=app_state["embedding_model"],
+        chroma_collection=app_state["chroma_collection"],
+        cfg=llm_cfg
+    )
+
+    tools = [knowledge_retriever]
     
     app_state["bot"] = Assistant(
         llm=llm_cfg,
         system_message=system_instruction,
         function_list=tools
     )
-    print("Агент (бот) успешно создан и настроен.")
-    print("--- Сервер готов к работе ---")
+    logger.info("Агент (бот) успешно создан и настроен с KnowledgeBaseRetriever.")
+    logger.info("--- Сервер готов к работе ---")
 
 def get_bot() -> Assistant:
     """Зависимость (dependency) для получения экземпляра бота в эндпоинтах."""
@@ -112,7 +133,7 @@ async def ask(request: AskRequest, bot: Assistant = Depends(get_bot)):
 
     try:
         # 1. Получаем историю диалога
-        messages = get_history(session_id)
+        messages = get_history(session_id, limit=HISTORY_MESSAGES_TO_KEEP)
         
         # 2. Добавляем текущий вопрос пользователя
         messages.append({'role': 'user', 'content': query})
@@ -120,23 +141,19 @@ async def ask(request: AskRequest, bot: Assistant = Depends(get_bot)):
         # 3. Сохраняем вопрос пользователя в БД
         add_message(session_id, 'user', query)
 
-        # Переменная для хранения полного ответа
-        full_response_content = ""
+        final_content = ""
+        assistant_responses = []
 
-        # Запускаем генератор и получаем финальный ответ
-        for response in bot.run(messages=messages):
-            # Нас интересует самое последнее сообщение в истории
-            last_message = response[-1]
-            if last_message.get('role') == 'assistant':
-                full_response_content = last_message.get('content', '')
+        # Запускаем генератор и дожидаемся, пока он полностью отработает.
+        # Переменная assistant_responses будет содержать итоговый список сообщений от ассистента.
+        for responses in bot.run(messages=messages):
+            assistant_responses = responses
 
-        # Теперь, когда у нас есть полный ответ, убираем из него "мысли"
-        final_content = full_response_content
-        think_end_tag = '</think>'
-        end_tag_pos = full_response_content.find(think_end_tag)
-        if end_tag_pos != -1:
-            # Отсекаем <think>...</think> и берем только чистый ответ
-            final_content = full_response_content[end_tag_pos + len(think_end_tag):].strip()
+        # Извлекаем контент из последнего сообщения ассистента.
+        # Qwen-Agent с `thought_in_content=False` возвращает ответ в `content` без "мыслей".
+        if assistant_responses and assistant_responses[-1].get('role') == 'assistant':
+            raw_content = assistant_responses[-1].get('content', '')
+            final_content = _strip_think_content(raw_content)
         
         if final_content:
             # 5. Сохраняем ответ ассистента в БД
@@ -145,7 +162,7 @@ async def ask(request: AskRequest, bot: Assistant = Depends(get_bot)):
         return AskResponse(answer=final_content)
 
     except Exception as e:
-        print(f"Критическая ошибка при обработке запроса: {e}")
+        logger.error(f"Критическая ошибка при обработке запроса: {e}", exc_info=True)
         # Возвращаем общее сообщение об ошибке, но в логах будет видно детальное исключение
         raise HTTPException(status_code=500, detail=f"Внутренняя ошибка сервера: {str(e)}")
 

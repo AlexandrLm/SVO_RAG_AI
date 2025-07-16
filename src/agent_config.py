@@ -1,15 +1,19 @@
 import json5
+import logging
 from qwen_agent.tools.base import BaseTool, register_tool
 from src.vector_store import search_in_store
+from src.config import LLM_MODEL_NAME, LLM_MODEL_SERVER, K_RETRIEVED_CHUNKS
 
-def get_llm_config(model_name='qwen3:latest', model_server='http://localhost:11434/v1'):
+logger = logging.getLogger(__name__)
+
+def get_llm_config():
     """Возвращает конфигурацию для LLM."""
     return {
-        'model': model_name,
-        'model_server': model_server,
+        'model': LLM_MODEL_NAME,
+        'model_server': LLM_MODEL_SERVER,
         'api_key': 'EMPTY',
         'generate_cfg': {
-            'thought_in_content': True,
+            'thought_in_content': False,
         }
     }
 
@@ -19,64 +23,55 @@ def get_system_instruction():
 Твоя задача — отвечать на вопросы пользователя, основываясь ИСКЛЮЧИТЕЛЬНО на предоставленной информации из документов.
 
 Правила работы:
-1. Внимательно проанализируй вопрос пользователя. Если он кажется тебе неполным или двусмысленным, задай уточняющий вопрос, прежде чем использовать инструменты.
-2. Для поиска информации всегда вызывай инструмент `helpdesk_retriever`.
-3. Внимательно изучи полученный из инструмента контекст.
-4. Сформулируй четкий и ясный ответ на основе этого контекста.
-5. Если в контексте нет информации для ответа, честно скажи: "К сожалению, я не нашел информации по вашему вопросу в документах."
-НИКОГДА не придумывай информацию.
+1. Для поиска информации всегда вызывай инструмент `knowledge_base_retriever`.
+2. Внимательно изучи полученный из инструмента контекст.
+3. Сформулируй четкий и ясный ответ на основе этого контекста.
+4. Если в контексте нет информации для ответа или инструмент вернул ошибку/пустой результат, твой ЕДИНСТВЕННЫЙ ответ должен быть: "К сожалению, я не нашел информации по вашему вопросу в документах."
+НИКОГДА не придумывай информацию и не используй свои общие знания.
 '''
 
-@register_tool('helpdesk_retriever')
-class HelpdeskRetriever(BaseTool):
+@register_tool('knowledge_base_retriever')
+class KnowledgeBaseRetriever(BaseTool):
     """
-    Кастомный инструмент для поиска информации в базе знаний по документам.
+    Инструмент для прямого поиска информации в базе знаний по документам.
     """
-    description = "Ищет релевантную информацию в базе знаний по документам для ответа на вопрос пользователя."
-    parameters = [{'name': 'query', 'type': 'string', 'description': 'Вопрос пользователя', 'required': True}]
+    description = (
+        "Ищет и извлекает релевантную информацию из базы знаний по документам для ответа на вопрос пользователя. "
+        "Используй этот инструмент всегда, когда нужно получить информацию из документов."
+    )
+    parameters = [{'name': 'query', 'type': 'string', 'description': 'Поисковый запрос, сформулированный на основе вопроса пользователя', 'required': True}]
 
-    def __init__(self, cfg=None):
+    def __init__(self, embedding_model, chroma_collection, cfg=None):
         super().__init__(cfg)
-        # Эти атрибуты будут установлены из main.py или server.py после инициализации
-        self.embedding_model = None
-        self.chroma_collection = None
+        if embedding_model is None or chroma_collection is None:
+            raise ValueError("embedding_model и chroma_collection должны быть предоставлены.")
+        self.embedding_model = embedding_model
+        self.chroma_collection = chroma_collection
 
     def call(self, params: str, **kwargs) -> str:
         query = ""
         try:
-            # Пытаемся распарсить JSON, который сгенерировала LLM
             parsed_params = json5.loads(params)
-            
-            if isinstance(parsed_params, dict):
-                # Идеальный случай: LLM вернула словарь {'query': '...'}.
-                query = parsed_params.get('query', '')
-            elif isinstance(parsed_params, list) and parsed_params:
-                # Случай, когда LLM вернула список: ['...']. Берем первый элемент.
-                query = str(parsed_params[0])
-            elif isinstance(parsed_params, str):
-                # Случай, когда LLM вернула просто строку в JSON: '"..."'
-                query = parsed_params
-            else:
-                # Если что-то еще, используем исходную строку как есть
-                query = params
-
+            query = parsed_params.get('query', '') if isinstance(parsed_params, dict) else str(parsed_params)
         except Exception:
-            # Если json5 не смог распарсить (например, LLM вернула невалидный JSON),
-            # считаем, что вся строка `params` и есть наш поисковый запрос.
-            print(f"Предупреждение: не удалось распарсить JSON от LLM: '{params}'. Используется вся строка как запрос.")
             query = params
-
-        # На всякий случай убираем лишние кавычки по краям, если они есть
-        query = query.strip().strip('"').strip("'")
-
-        if not query:
-            return "Ошибка: не удалось извлечь поисковый запрос из параметров LLM."
         
-        if not all([self.embedding_model, self.chroma_collection]):
-            return "Ошибка: Компоненты для поиска (модель, коллекция ChromaDB) не инициализированы."
+        query = query.strip().strip('"').strip("'")
+        if not query:
+            logger.warning("Получен пустой поисковый запрос.")
+            return "Поиск не дал результатов."
 
-        return search_in_store(
-            query=query,
-            model=self.embedding_model,
-            collection=self.chroma_collection
-        ) 
+        try:
+            docs = search_in_store(query, self.embedding_model, self.chroma_collection, k=K_RETRIEVED_CHUNKS)
+            
+            if not docs:
+                logger.info("В базе знаний не найдено релевантных чанков.")
+                return "Поиск не дал результатов."
+
+            final_context = "\n\n---\n\n".join(docs)
+            logger.info(f"Найдено {len(docs)} релевантн(ых) чанков.")
+            return final_context
+            
+        except Exception as e:
+            logger.error(f"Произошла ошибка при поиске в базе знаний: {e}", exc_info=True)
+            return "Ошибка при поиске в базе знаний." 
