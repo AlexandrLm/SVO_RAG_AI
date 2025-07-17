@@ -24,7 +24,7 @@ def get_llm_config():
     return {
         'model': 'qwen/qwen3-235b-a22b:free',
         'model_server': 'https://openrouter.ai/api/v1',
-        'api_key': os.getenv('OPENROUTER_API_KEY', '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'), # Замените на ваш ключ или оставьте getenv
+        'api_key': os.getenv('OPENROUTER_API_KEY', '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'), # Замените на ваш ключ или оставьте getenv
         'generate_cfg': {
             'thought_in_content': False,
             'fncall_prompt_type': 'nous',
